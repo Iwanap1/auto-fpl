@@ -86,26 +86,118 @@ def get_current_team(email, password, manager_id):
     return team
 
 
-def is_injured():
+def check_injury(player_id):
     """
-    Check if the player is injured.
+    Given a player's element ID, returns injury/availability info.
+    Output: dict with keys 'status', 'news', 'news_added'.
+    Example: {
+    'status_code': 'i',
+    'status': 'Injured',
+    'news': 'Hamstring injury - Expected back 24 Aug',
+    'news_added': '2025-08-08T10:32:00Z'
+}
+    """
+    r = requests.get(ENDPOINTS["bootstrap_static"], timeout=15)
+    r.raise_for_status()
+    data = r.json()
+    elements = data.get("elements", [])
     
-    Returns:
-        bool: True if the player is injured, False otherwise.
-    """
-    # Placeholder for actual injury check logic
-    return False
+    player = next((p for p in elements if p["id"] == player_id), None)
+    if not player:
+        raise ValueError(f"No player found with id={player_id}")
+    
+    status_map = {
+        "a": "Available",
+        "i": "Injured",
+        "d": "Doubtful",
+        "s": "Suspended",
+        "n": "Not in squad",
+        "u": "Unavailable",
+    }
+    
+    return {
+        "status_code": player["status"],
+        "status": status_map.get(player["status"], "Unknown"),
+        "news": player.get("news", ""),
+        "news_added": player.get("news_added", None)
+    }
 
 
-def fixture_list(team, n_fixtures):
+def fixture_list_by_gw(team, n_gameweeks):
     """
-    Get a list of upcoming fixtures for a given team.
-    
+    Get fixtures for the next N gameweeks for a given team.
+    Excludes postponed and TBD fixtures entirely.
+    Includes all matches in a DGW, blanks will have 0 fixtures.
+
     Args:
-        n_fixtures (int): Number of upcoming fixtures to retrieve
-    
-    Returns:
-        list: A list of n upcoming fixtures
-    """
+        team (str|int): Team name ('Arsenal') or ID (1–20)
+        n_gameweeks (int): Number of upcoming GWs
 
-    return [f"Fixture {i + 1}" for i in range(n_fixtures)]
+    Returns:
+        list[dict]: [
+          {'event': 3, 'deadline_utc': '...', 'fixtures': [...], 'is_double': False},
+          ...
+        ]
+    """
+    bt = requests.get(ENDPOINTS['static'], timeout=15).json()
+    teams = bt["teams"]
+    events = bt["events"]
+
+    # Resolve team_id
+    if isinstance(team, str):
+        t = next((x for x in teams if x["name"].lower() == team.lower()), None)
+        if not t:
+            raise ValueError(f"Team '{team}' not found.")
+        team_id = t["id"]
+    else:
+        team_id = int(team)
+
+    # Target events
+    start_event = next_gw()
+    start_id = start_event["id"]
+    target_events = [e for e in events if e["id"] >= start_id][:n_gameweeks]
+    target_ids = {e["id"] for e in target_events}
+
+    # Fixtures
+    fx = requests.get(ENDPOINTS["fixtures"], timeout=15).json()
+    id_to_name = {t["id"]: t["name"] for t in teams}
+
+    # Prepare output buckets
+    out_by_event = {
+        e["id"]: {
+            "event": e["id"],
+            "deadline_utc": e.get("deadline_time"),
+            "fixtures": []
+        }
+        for e in target_events
+    }
+
+    for f in fx:
+        if f.get("postponed", False):
+            continue  # skip postponed
+        if f.get("kickoff_time") is None:
+            continue  # skip TBD
+        if f.get("event") not in target_ids:
+            continue
+        if not (f["team_h"] == team_id or f["team_a"] == team_id):
+            continue
+
+        home = (f["team_h"] == team_id)
+        opp_id = f["team_a"] if home else f["team_h"]
+
+        out_by_event[f["event"]]["fixtures"].append({
+            "opponent": id_to_name[opp_id],
+            "home": home,
+            "kickoff_time": f["kickoff_time"],
+            "status": "Scheduled"
+        })
+
+    # Final ordering & double flags
+    ordered = []
+    for e in target_events:
+        rec = out_by_event[e["id"]]
+        rec["fixtures"].sort(key=lambda x: x["kickoff_time"])
+        rec["is_double"] = len(rec["fixtures"]) > 1
+        ordered.append(rec)
+
+    return ordered

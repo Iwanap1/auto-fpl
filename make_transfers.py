@@ -14,3 +14,4 @@ current_team = get_current_team(email, password, manager_id)
 #     "midfielders": [int, int, int, int, int],
 #     "forwards": [int, int, int]
 # }
+

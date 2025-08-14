@@ -7,7 +7,7 @@ You fill these two.
 from typing import Tuple
 from player import Player
 
-# form: SUM(prev_fixture_points / (gw_current - prev_fixture_gw)) considers previous season as gw0 = season_total / 38
+# form: 
 # ict_index: ict_index from FPL
 # transfer_ratio: transfers_in / (transfers_in + transfers_out) for upcoming GW
 
@@ -32,10 +32,3 @@ def get_features(feature_df, pid, gw) -> Tuple[float, float, float, float, float
     return tuple(float(v) for v in values)
 
 
-
-def get_xp(player: Player) -> float:
-    """
-    Use player.features (and anything else you like) to compute xP.
-    Return expected points as a float.
-    """
-    raise NotImplementedError("Implement your xP model here.")

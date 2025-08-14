@@ -1,0 +1,22 @@
+name: auto_fpl
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  # Core
+  - python=3.10
+  - pip
+  - numpy
+  - pandas
+  - matplotlib
+  - seaborn
+  - gymnasium=0.29.1
+  - stable-baselines3=2.3.2
+  - cloudpickle
+  - tqdm
+  - psutil
+
+  - pip:
+      - ray[rllib]==2.31.0
+      - tensorboard
+      - protobuf<5

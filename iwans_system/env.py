@@ -3,7 +3,7 @@ from gymnasium import spaces
 import numpy as np
 from typing import List, Dict, Tuple, Callable, Any
 import random
-
+import copy
 from player import Player
 from squad import Squad, POS_ORDER, SQUAD_REQUIREMENTS, MAX_PER_CLUB
 
@@ -99,12 +99,17 @@ class FPLEnv(gym.Env):
         self.squad: Squad = None  # type: ignore
         self.free_transfers: int = 1
 
-        # Action space: MultiDiscrete([16, pool_size+1]) — we set pool_size at reset()
-        # Use a valid placeholder now (second dim=1) to satisfy Gym/SB3 before reset()
-        self.action_space = spaces.MultiDiscrete([15 + 1, 1])
+        self.action_space = spaces.MultiDiscrete([
+            16,                    # out1: 0..14 are squad slots, 15 = "no transfer"
+            self.max_pool_size+1,  # in1:  0..max_pool_size-1, max_pool_size = "no transfer"
+            16,                    # out2: 0..14, 15 = "no second transfer"
+            self.max_pool_size+1,  # in2:  sentinel as above
+            15,                    # cap:  0..14
+            15,                    # vc:   0..14
+        ])
 
-        # Observation: 15 × (price, xP, 5 features) + bank
-        self.obs_dim = 15 * 9 + 1
+        # Observation: 15 × (price, xP, 5 features) + bank + free transfers
+        self.obs_dim = 15 * 9 + 2
         self.observation_space = spaces.Box(low=-np.inf, high=np.inf,
                                             shape=(self.obs_dim,), dtype=np.float32)
 
@@ -200,12 +205,12 @@ class FPLEnv(gym.Env):
 
 
     def _obs(self) -> np.ndarray:
-        vecs = [
-            self._pvec(p, is_c=(i == self._captain_idx), is_v=(i == self._vice_idx))
-            for i, p in enumerate(self.squad.players)
-        ]
+        vecs = [self._pvec(p, is_c=(i == self._captain_idx), is_v=(i == self._vice_idx))
+                for i, p in enumerate(self.squad.players)]
         flat = np.concatenate(vecs, axis=0)
-        return np.concatenate([flat, np.array([self.squad.bank], dtype=np.float32)], axis=0)
+        extras = np.array([self.squad.bank, float(self.free_transfers)], dtype=np.float32)
+        return np.concatenate([flat, extras], axis=0)
+
 
     def _semi_random_initial_squad(self) -> Squad:
         rng = np.random.default_rng()
@@ -405,7 +410,7 @@ class FPLEnv(gym.Env):
         self.pool = pool_gw1
         self.index_map = index_map_gw1
         self.pool_size = len(self.pool)
-        self.action_space = spaces.MultiDiscrete([15 + 1, max(1, self.pool_size) + 1, 15, 15])
+        # self.action_space = spaces.MultiDiscrete([15 + 1, max(1, self.pool_size) + 1, 15, 15])
 
         self.squad = self._semi_random_initial_squad()
         self._xi_idx = self._best_xi()
@@ -423,7 +428,7 @@ class FPLEnv(gym.Env):
             self._points_map, self._played_map = {}, {}
 
         self.pool_size = len(self.pool)
-        self.action_space = spaces.MultiDiscrete([15 + 1, self.pool_size + 1, 15, 15])
+        # self.action_space = spaces.MultiDiscrete([15 + 1, self.pool_size + 1, 15, 15])
 
         pid_to_pool = {pl.pid: pl for pl in self.pool}
         for i, p in enumerate(self.squad.players):
@@ -448,9 +453,18 @@ class FPLEnv(gym.Env):
             "points_hit": points_hit
         }
 
-    
+
     def step(self, action: np.ndarray):
-        out_idx, incoming_idx, cap_idx, vc_idx = map(int, action)
+        """
+        Action = (out1, in1, out2, in2, cap_idx, vc_idx)
+        - out* in {0..14}, 15 = 'no transfer'
+        - in*  in {0..pool_size-1}, pool_size = 'no transfer'
+        - cap_idx, vc_idx in {0..14}
+
+        Both transfers are decided relative to the ORIGINAL squad of this GW.
+        We validate/apply them on a temporary copy, then commit once both pass.
+        """
+        # --- episode end guard ---
         if self.step_in_episode >= self.episode_gws:
             return self._obs(), 0.0, True, False, self._info_dict(action="already_done")
 
@@ -458,32 +472,98 @@ class FPLEnv(gym.Env):
         done = False
         points_hit = 0.0
 
+        # --- parse & normalize ---
+        a = np.asarray(action, dtype=np.int64).reshape(-1)
+        if a.size != 6:
+            raise ValueError(f"Expected 6 ints (out1,in1,out2,in2,cap,vc); got {a} with shape {a.shape}")
+        out1, in1, out2, in2, cap_idx, vc_idx = map(int, a)
+
+        # Bring incoming sentinels in line with current pool size
+        if in1 >= self.pool_size: in1 = self.pool_size
+        if in2 >= self.pool_size: in2 = self.pool_size
+
+        # Snapshot ORIGINAL state for planning + baseline comparison
         baseline_players = list(self.squad.players)
+        baseline_squad   = copy.deepcopy(self.squad)  # deep copy to trial swaps
 
-        did_transfer = False
-        if not (out_idx == 15 or incoming_idx == self.pool_size):
-            if incoming_idx >= self.pool_size or out_idx >= 15:
-                return self._obs(), self.illegal_penalty, False, False, {"illegal": "index_out_of_range"}
-            incoming = self.pool[incoming_idx]
-            if not self.squad.can_swap(out_idx, incoming):
-                return self._obs(), self.illegal_penalty, False, False, {"illegal": "cannot_swap"}
-            self.squad.apply_swap(out_idx, incoming)
-            did_transfer = True
-            if self.free_transfers > 0:
-                self.free_transfers -= 1
-            else:
-                points_hit = self.transfer_hit
+        # --- helpers ---
+        def is_skip(o, i) -> bool:
+            return (o >= 15) or (i >= self.pool_size)
 
+        def validate_bounds(o_idx: int, i_idx: int) -> Tuple[bool, Dict[str, str]]:
+            if o_idx < 0 or o_idx > 15:
+                return False, {"illegal": "out_of_range"}
+            if i_idx < 0 or i_idx > self.pool_size:
+                return False, {"illegal": "in_of_range"}
+            return True, {}
+
+        # --- guards to forbid weird combos (based on ORIGINAL squad) ---
+        # If both transfers requested, disallow using the same out-slot twice
+        if not is_skip(out1, in1) and not is_skip(out2, in2):
+            if out1 == out2:
+                return self._obs(), self.illegal_penalty, False, False, {"illegal": "duplicate_out_slot"}
+            # Forbid buy-back of the other swap’s sold player (based on original PID)
+            sold1_pid = baseline_players[out1].pid if out1 < 15 else None
+            sold2_pid = baseline_players[out2].pid if out2 < 15 else None
+            if in2 < self.pool_size and sold1_pid is not None and self.pool[in2].pid == sold1_pid:
+                return self._obs(), self.illegal_penalty, False, False, {"illegal": "buy_back_same_player"}
+            if in1 < self.pool_size and sold2_pid is not None and self.pool[in1].pid == sold2_pid:
+                return self._obs(), self.illegal_penalty, False, False, {"illegal": "buy_back_same_player"}
+
+        # --- validate bounds early ---
+        for (o_idx, i_idx) in [(out1, in1), (out2, in2)]:
+            ok, info = validate_bounds(o_idx, i_idx)
+            if not ok:
+                return self._obs(), self.illegal_penalty, False, False, info
+
+        # --- attempt swaps on the TEMP copy of the baseline squad ---
+        def try_apply_on_temp(temp_squad: "Squad", o_idx: int, i_idx: int) -> Tuple[bool, Dict[str, str]]:
+            if is_skip(o_idx, i_idx):
+                return False, {}
+            if o_idx >= 15 or i_idx >= self.pool_size:
+                return False, {"illegal": "index_out_of_range"}
+            incoming = self.pool[i_idx]
+            if not temp_squad.can_swap(o_idx, incoming):
+                return False, {"illegal": "cannot_swap"}
+            temp_squad.apply_swap(o_idx, incoming)  # in-place replace at slot o_idx
+            return True, {}
+
+        # Work entirely on temp copy; this ensures both swaps are planned off ORIGINAL indices
+        temp_squad = copy.deepcopy(baseline_squad)
+        applied1, info1 = try_apply_on_temp(temp_squad, out1, in1)
+        if info1.get("illegal"):
+            return self._obs(), self.illegal_penalty, False, False, info1
+
+        applied2, info2 = try_apply_on_temp(temp_squad, out2, in2)
+        if info2.get("illegal"):
+            return self._obs(), self.illegal_penalty, False, False, info2
+
+        # --- compute hits (relative to current free_transfers) ---
+        transfers_made = int(applied1) + int(applied2)
+        ft_consumed = min(self.free_transfers, transfers_made)
+        extra_transfers = transfers_made - ft_consumed
+        if extra_transfers > 0:
+            points_hit += self.transfer_hit * extra_transfers
+
+        # --- commit temp result to real squad ---
+        if transfers_made > 0:
+            self.squad = temp_squad
+            self.free_transfers -= ft_consumed
+            if self.free_transfers < 0:
+                self.free_transfers = 0
+
+        # --- (Re)pick XI & apply C/VC (must be in XI and distinct) ---
         self._xi_idx = self._best_xi()
-
+        if not (0 <= cap_idx < 15 and 0 <= vc_idx < 15):
+            return self._obs(), self.illegal_penalty, False, False, {"illegal": "cap_vc_out_of_range"}
         if cap_idx == vc_idx:
             return self._obs(), self.illegal_penalty, False, False, {"illegal": "cap_eq_vc"}
         if cap_idx not in self._xi_idx or vc_idx not in self._xi_idx:
             return self._obs(), self.illegal_penalty, False, False, {"illegal": "band_not_in_XI"}
-
         self._captain_idx = cap_idx
         self._vice_idx    = vc_idx
 
+        # --- realized vs skip (counterfactual) ---
         points_map = getattr(self, "_points_map", {})
         played_map = getattr(self, "_played_map", {})
 
@@ -491,6 +571,7 @@ class FPLEnv(gym.Env):
             self.squad.players, self._xi_idx, self._captain_idx, self._vice_idx, points_map, played_map
         )
 
+        # Baseline (no transfers) greedy XI & band on original
         def _best_xi_and_band_tmp(players):
             pos_lists = {pos: sorted([(i, q) for i, q in enumerate(players) if q.pos == pos],
                                     key=lambda t: t[1].xP, reverse=True) for pos in POS_ORDER}
@@ -508,9 +589,9 @@ class FPLEnv(gym.Env):
             if not best_xi:
                 best_xi = sorted(range(len(players)), key=lambda i: players[i].xP, reverse=True)[:11]
             xi_sorted = sorted(best_xi, key=lambda i: players[i].xP, reverse=True)
-            cap_idx = xi_sorted[0]
-            vc_idx  = xi_sorted[1] if len(xi_sorted) > 1 else xi_sorted[0]
-            return best_xi, cap_idx, vc_idx
+            cap = xi_sorted[0]
+            vc  = xi_sorted[1] if len(xi_sorted) > 1 else xi_sorted[0]
+            return best_xi, cap, vc
 
         xi_b, cap_b, vc_b = _best_xi_and_band_tmp(baseline_players)
         skip_realized = self._realized_team_score(
@@ -518,9 +599,9 @@ class FPLEnv(gym.Env):
         )
 
         reward = (actual_realized - skip_realized) + points_hit
-        self._team_score_exp = actual_realized  # for info
+        self._team_score_exp = actual_realized  # for info panel
 
-        # advance GW
+        # --- advance GW ---
         self.current_gw += 1
         if self.step_in_episode < self.episode_gws:
             result = self.load_gw_fn(self.season_ctx, self.current_gw)
@@ -532,18 +613,18 @@ class FPLEnv(gym.Env):
                 self._points_map, self._played_map = {}, {}
 
             self.pool_size = len(self.pool)
-            self.action_space = spaces.MultiDiscrete([15 + 1, self.pool_size + 1, 15, 15])
 
-            # Refresh squad players to gw stats before next gw
-            pid_to_pool: Dict[int, Player] = {pl.pid: pl for pl in self.pool}
+            # Refresh squad players with next-GW stats (by PID)
+            pid_to_pool = {pl.pid: pl for pl in self.pool}
             for i, p in enumerate(self.squad.players):
                 if p.pid in pid_to_pool:
                     self.squad.players[i] = pid_to_pool[p.pid]
 
-            if not did_transfer:
+            # Bank a FT only if no transfers were made this GW
+            if transfers_made == 0:
                 self.free_transfers = min(self.free_transfers + 1, self.max_free_transfers)
-
         else:
             done = True
 
         return self._obs(), reward, done, False, self._info_dict(action="step", points_hit=points_hit)
+

@@ -3,7 +3,7 @@ import numpy as np
 import pandas as pd
 from player import Player
 from squad import POS_ORDER
-from features import get_features, get_xp
+from features import get_features
 from xp import ScorePredictor
 from typing import Optional
 

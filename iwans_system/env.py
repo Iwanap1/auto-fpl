@@ -65,8 +65,9 @@ class FPLEnv(gym.Env):
         models: List,
         start_gw: int = 1,
         budget: float = 100.0,
-        illegal_penalty: float = -0.2,
+        illegal_penalty: float = -8,
         temperature: float = 1.0,
+        pool_per_pos: int = 20, # number of players to choose from in each position
         transfer_hit: float = -4.0,
         max_free_transfers: int = 5
     ):
@@ -82,7 +83,7 @@ class FPLEnv(gym.Env):
         self.temperature = float(temperature)
         self.transfer_hit = float(transfer_hit)
         self.max_free_transfers = int(max_free_transfers)
-
+        self.max_pool_size = 4 * pool_per_pos
         # Will be set at reset()
         self.season: str = ""
         self.season_ctx: Any = None
@@ -104,8 +105,6 @@ class FPLEnv(gym.Env):
             self.max_pool_size+1,  # in1:  0..max_pool_size-1, max_pool_size = "no transfer"
             16,                    # out2: 0..14, 15 = "no second transfer"
             self.max_pool_size+1,  # in2:  sentinel as above
-            15,                    # cap:  0..14
-            15,                    # vc:   0..14
         ])
 
         # Observation: 15 × (price, xP, 5 features) + bank + free transfers
@@ -414,9 +413,7 @@ class FPLEnv(gym.Env):
 
         self.squad = self._semi_random_initial_squad()
         self._xi_idx = self._best_xi()
-        xi_sorted = sorted(self._xi_idx, key=lambda i: self.squad.players[i].xP, reverse=True)
-        self._captain_idx = xi_sorted[0]
-        self._vice_idx    = xi_sorted[1] if len(xi_sorted) > 1 else xi_sorted[0]
+        self._captain_idx, self._vice_idx = self._best_band_for_xi(self._xi_idx)
         self._team_score_exp = self._expected_team_score(self._xi_idx, self._captain_idx, self._vice_idx)
         self.current_gw = 2
         result_gw2 = self.load_gw_fn(self.season_ctx, 2)
@@ -437,7 +434,12 @@ class FPLEnv(gym.Env):
 
         return self._obs(), self._info_dict(action="init_gw2")
 
-
+    def _best_band_for_xi(self, xi_idx):
+        # Sort XI by xP, highest first
+        sorted_xi = sorted(xi_idx, key=lambda i: self.squad.players[i].xP, reverse=True)
+        cap_idx = sorted_xi[0]
+        vc_idx  = sorted_xi[1] if len(sorted_xi) > 1 else cap_idx
+        return cap_idx, vc_idx
 
     def _info_dict(self, action: str, points_hit: float = 0.0):
         return {
@@ -474,9 +476,9 @@ class FPLEnv(gym.Env):
 
         # --- parse & normalize ---
         a = np.asarray(action, dtype=np.int64).reshape(-1)
-        if a.size != 6:
+        if a.size != 4:
             raise ValueError(f"Expected 6 ints (out1,in1,out2,in2,cap,vc); got {a} with shape {a.shape}")
-        out1, in1, out2, in2, cap_idx, vc_idx = map(int, a)
+        out1, in1, out2, in2 = map(int, a)
 
         # Bring incoming sentinels in line with current pool size
         if in1 >= self.pool_size: in1 = self.pool_size
@@ -497,7 +499,7 @@ class FPLEnv(gym.Env):
                 return False, {"illegal": "in_of_range"}
             return True, {}
 
-        # --- guards to forbid weird combos (based on ORIGINAL squad) ---
+        # --- guards to forbid certain combinations of both transfers ---
         # If both transfers requested, disallow using the same out-slot twice
         if not is_skip(out1, in1) and not is_skip(out2, in2):
             if out1 == out2:
@@ -554,14 +556,7 @@ class FPLEnv(gym.Env):
 
         # --- (Re)pick XI & apply C/VC (must be in XI and distinct) ---
         self._xi_idx = self._best_xi()
-        if not (0 <= cap_idx < 15 and 0 <= vc_idx < 15):
-            return self._obs(), self.illegal_penalty, False, False, {"illegal": "cap_vc_out_of_range"}
-        if cap_idx == vc_idx:
-            return self._obs(), self.illegal_penalty, False, False, {"illegal": "cap_eq_vc"}
-        if cap_idx not in self._xi_idx or vc_idx not in self._xi_idx:
-            return self._obs(), self.illegal_penalty, False, False, {"illegal": "band_not_in_XI"}
-        self._captain_idx = cap_idx
-        self._vice_idx    = vc_idx
+        self._captain_idx, self._vice_idx = self._best_band_for_xi(self._xi_idx)
 
         # --- realized vs skip (counterfactual) ---
         points_map = getattr(self, "_points_map", {})

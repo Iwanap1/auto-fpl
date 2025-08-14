@@ -1,0 +1,2 @@
+PER_POS = 20
+TEMP = 1.0

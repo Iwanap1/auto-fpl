@@ -48,7 +48,7 @@ def load_gw_fn(season_ctx, gw):
     season     = season_ctx["season"]
     fixtures   = season_ctx["fixtures"]
     teams      = season_ctx["teams"]
-    features_df = load_csv(f"{season}.csv")  # your 5-feature file
+    features_df = load_csv(f"feature_data/{season}_features.csv")  # feature file
     gw_df = load_csv(f"{season_dir}/gws/gw{gw}.csv")
 
     predictor = season_ctx.get("predictor", None)

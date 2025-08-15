@@ -4,15 +4,23 @@ import numpy as np
 from stable_baselines3.common.vec_env import SubprocVecEnv, VecMonitor
 from sb3_contrib import MaskablePPO
 from sb3_contrib.common.wrappers.action_masker import ActionMasker
-
+from stable_baselines3.common.callbacks import CheckpointCallback
+from stable_baselines3.common.utils import set_random_seed
 from xp import load_models
 from data_utils import load_season_fn, load_gw_fn
 from env import FPLEnv
-
 from masked_ppo_wrapper import DiscreteActionSetWrapper, mask_fn
+import gym
 
+class RandomizeBudgetOnReset(gym.Wrapper):
+    def __init__(self, env):
+        super().__init__(env)
+        self._vals = np.round(np.arange(99.5, 102.5 + 1e-9, 0.1), 1)
 
-# --------- single-env factory (wrapped) ----------
+    def reset(self, **kwargs):
+        self.env.unwrapped.budget = float(np.random.choice(self._vals))
+        return self.env.reset(**kwargs)
+
 def make_env_fn(BASE_DIR, SEASONS, MODELS, seed=None):
     def _thunk():
         env = FPLEnv(
@@ -21,32 +29,41 @@ def make_env_fn(BASE_DIR, SEASONS, MODELS, seed=None):
             seasons=SEASONS,
             base_dir=BASE_DIR,
             start_gw=2,
-            budget=100.0,
+            budget=100.0,           # overwritten on every reset by wrapper
             temperature=0.8,
             transfer_hit=-4.0,
             max_free_transfers=5,
             models=MODELS,
         )
-        # 1) turn MultiDiscrete into Discrete with dynamic legal set
-        env = DiscreteActionSetWrapper(env)
-        # 2) plug in action masking for the Discrete space
-        env = ActionMasker(env, mask_fn)
+        env = RandomizeBudgetOnReset(env)   # randomize budget each episode
+        env = DiscreteActionSetWrapper(env) # MultiDiscrete -> Discrete choices
+        env = ActionMasker(env, mask_fn)    # action masking
         return env
     return _thunk
 
-
 def main():
     BASE_DIR = "../data/Fantasy-Premier-League"
-    SEASONS  = ["2019-20", "2020-21", "2021-22", "2023-24"]
+    SEASONS  = ["2020-21", "2021-22", "2022-23", "2023-24"]
     MODELS   = load_models("../models/rand_forest/classifiers")
 
-    # ---- parallel envs
-    NUM_ENVS = os.cpu_count() // 2 or 4  # choose what you like
-    env_fns = [make_env_fn(BASE_DIR, SEASONS, MODELS) for _ in range(NUM_ENVS)]
-    vec_env = SubprocVecEnv(env_fns, start_method="forkserver")  # or "spawn" on Windows
-    vec_env = VecMonitor(vec_env)
+    # parallel envs
+    ncpu = int(os.environ.get("NCPUS", os.cpu_count() or 16))
+    NUM_ENVS = max(8, min(ncpu - 2, 14))   # e.g., 12 on a 16-core node
 
-    # ---- build MaskablePPO (no PyTorch hacking needed)
+    env_fns = [make_env_fn(BASE_DIR, SEASONS, MODELS) for _ in range(NUM_ENVS)]
+    vec_env = SubprocVecEnv(env_fns, start_method="forkserver")
+    vec_env = VecMonitor(vec_env)
+    vec_env.seed(42)                        # ← reproducible (optional)
+    set_random_seed(42)
+
+    os.makedirs("./checkpoints", exist_ok=True)  # ← ensure exists
+    rollout_size = NUM_ENVS * 2048
+    ckpt = CheckpointCallback(
+        save_freq=rollout_size * 5,
+        save_path="./checkpoints",
+        name_prefix="ppo_fpl_masked"
+    )
+
     model = MaskablePPO(
         policy="MlpPolicy",
         env=vec_env,
@@ -59,16 +76,19 @@ def main():
         ent_coef=0.0,
         clip_range=0.2,
         tensorboard_log="./tb_masked",
+        # Optional: slightly bigger net
+        # policy_kwargs=dict(net_arch=[256, 256]),
     )
 
-    model.learn(total_timesteps=2_000_000)
+    model.learn(total_timesteps=2_000_000, callback=ckpt)
     model.save("ppo_fpl_masked_discrete_parallel")
+
+    # quick sanity rollout
     test_env = make_env_fn(BASE_DIR, SEASONS, MODELS)()
     obs, info = test_env.reset()
     for _ in range(10):
-        action, _ = model.predict(obs, deterministic=False)
-        # hard assert the chosen action is valid
         mask = mask_fn(test_env)
+        action, _ = model.predict(obs, deterministic=False, action_masks=mask)  # ← pass mask here
         assert mask[action] == 1, f"Picked illegal action index {action}"
         obs, reward, terminated, truncated, info = test_env.step(action)
         if terminated or truncated:
@@ -76,7 +96,6 @@ def main():
     test_env.close()
 
     vec_env.close()
-
 
 if __name__ == "__main__":
     main()

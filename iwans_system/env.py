@@ -83,7 +83,7 @@ class FPLEnv(gym.Env):
         self.max_pool_size = 4 * pool_per_pos
         self.SKIP_IN = self.max_pool_size
         self.n_features = int(n_features)
-        
+        self.per_pos = int(pool_per_pos)
         # Will be set at reset()
         self.season: str = ""
         self.season_ctx: Any = None
@@ -516,7 +516,7 @@ class FPLEnv(gym.Env):
         self.free_transfers = 1
 
         # Load pool + realized maps for the CURRENT GW
-        result = self.load_gw_fn(self.season_ctx, self.current_gw)
+        result = self.load_gw_fn(self.season_ctx, self.current_gw, per_pos=self.per_pos, temperature=self.temperature)
         if isinstance(result, tuple) and len(result) == 3:
             self.pool, self.index_map, gw_df = result
             self._points_map, self._played_map = self._gw_points_maps_from_df(gw_df)
@@ -607,9 +607,9 @@ class FPLEnv(gym.Env):
         # If we're in phase 1, we don't sanitize 'inn' further (skip-only mask is fine)
         # If we're in phase 2, recompute an 'in' mask for the actually chosen out
         if self.phase == 1:
-            # Use the coarse mask; anything non-allowed becomes SKIP
-            _, mask_in = self._build_masks()
-            if mask_in[inn] == 0:
+            # ✅ Phase-1: validate IN against per-OUT legality, not the coarse skip-only mask
+            mask_in1 = self._legal_incoming_indices(self.squad, out)
+            if inn < 0 or inn > self.max_pool_size or mask_in1[inn] == 0:
                 inn = self.SKIP_IN
         else:
             # Build phase-2 context (same logic as in _build_masks)
@@ -748,7 +748,7 @@ class FPLEnv(gym.Env):
 
         if not done:
             # Load next GW pool/maps
-            result = self.load_gw_fn(self.season_ctx, self.current_gw)
+            result = self.load_gw_fn(self.season_ctx, self.current_gw, per_pos=self.per_pos, temperature=self.temperature)
             if isinstance(result, tuple) and len(result) == 3:
                 self.pool, self.index_map, next_gw_df = result
                 self._points_map, self._played_map = self._gw_points_maps_from_df(next_gw_df)

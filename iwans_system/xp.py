@@ -33,6 +33,7 @@ class ScorePredictor:
     per-position inference in batch. Returns probability (binary clf) or
     regressed xP (regressor). You can convert probability->xP if you wish.
     """
+
     def __init__(self,
                  season: str,
                  players_raw_df: pd.DataFrame,
@@ -97,6 +98,46 @@ class ScorePredictor:
             out.update({pid: float(v) for pid, v in zip(pids_ok, xp)})
 
         return out
+
+    _POS_INV = {1: "GK", 2: "DEF", 3: "MID", 4: "FWD"}
+    
+    def xp_map_strict_for_candidates(
+        self,
+        gw: int,
+        candidate_pids: list[int],
+        players_raw_df,
+        fixtures_df,
+    ) -> dict[int, float]:
+        """
+        Compute xP only for candidate_pids.
+        - If a candidate's team has a fixture in GW, they MUST have xP (raise if missing).
+        - If no fixture, xP = 0.0 is allowed.
+        """
+        pr = players_raw_df.set_index("id")
+        # teams that play in this GW
+        f = fixtures_df.loc[fixtures_df["event"] == gw, ["team_h", "team_a"]]
+        teams_with_fixture = set(pd.concat([f["team_h"], f["team_a"]]).astype(int).tolist())
+
+        # split candidates by whether their team plays
+        with_fx, no_fx = [], []
+        for pid in candidate_pids:
+            team_id = int(pr.at[pid, "team"])
+            (with_fx if team_id in teams_with_fixture else no_fx).append(pid)
+
+        # predict only for players whose teams play
+        pid_pos = [(pid, self._POS_INV[int(pr.at[pid, "element_type"])]) for pid in with_fx]
+        xp_pred = self.predict_batch(pid_pos, gw)  # {pid: xp}
+
+        # strict check: all with fixtures must be present
+        missing = set(with_fx) - set(xp_pred.keys())
+        if missing:
+            raise ValueError(f"Missing xP for candidates with fixtures: {sorted(list(missing))[:8]} ...")
+
+        # assemble final map (0.0 for blanks)
+        xp_map = {pid: 0.0 for pid in candidate_pids}
+        xp_map.update(xp_pred)
+        return xp_map
+
 
     # --------- Your feature builders (kept as you wrote them) ----------
     def prepare_data(self, pid, gw):

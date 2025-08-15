@@ -8,7 +8,7 @@ class Player:
     pos: str               # {"GK","DEF","MID","FWD"}
     team: str
     team_id: int
-    price: float           # £m
-    features: Tuple[float, float, float, float, float]  # n=5 where index 4 is prob of playing
-    pooling_metric: float  # for candidate sampling/ranking
-    xP: float              # expected points
+    price: float           
+    features: Tuple # Last element must be availability
+    pooling_metric: float  
+    xP: float              

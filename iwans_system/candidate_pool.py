@@ -117,7 +117,7 @@ def build_candidate_pool_from_gw(
             pids.append(pid); poss.append(str(r["position"]))
         except Exception as e:
             print(e)
-            feats_list.append((0.0,0.0,0.0,0.0,1.0))  # safe default
+            feats_list.append((0.0,0.0,0.0,0.0,0.0,0.0,1.0))  # safe default
             pids.append(pid); poss.append(str(r["position"]))
             skipped.append(pid)
     pool_df["features"] = feats_list  # for inspection/debug
@@ -139,10 +139,8 @@ def build_candidate_pool_from_gw(
         # xP priority: predictor -> gw_df column 'xP' -> feature proxy
         if pid in xp_map:
             xp = float(xp_map[pid])
-        elif "xP" in r and pd.notna(r["xP"]):
-            xp = float(r["xP"])
         else:
-            xp = float(feats[0])  # fallback to 'form' as a weak proxy
+            raise ValueError(f"Player {pid} not found in predictor xP map.")
 
         p = Player(
             pid=pid,

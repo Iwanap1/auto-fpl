@@ -19,21 +19,11 @@ def _softmax(x: np.ndarray, temp: float = 1.0) -> np.ndarray:
     return e / (np.nansum(e) + 1e-12)
 
 def _p_play(p: Player) -> float:
-    """
-    features[4] is a discrete probability in {0, 0.25, 0.5, 0.75, 1}.
-    We snap to the nearest allowed value to be robust to any float noise.
-    """
     try:
-        v = float(p.features[4])
+        v = float(p.features[-1])  # last element in features tuple
     except Exception:
-        return 1.0  # safe default: assume they play
-
-    if not np.isfinite(v):
         return 1.0
-
-    v = float(np.clip(v, 0.0, 1.0))
-    allowed = np.array([0.0, 0.25, 0.5, 0.75, 1.0], dtype=np.float32)
-    return float(allowed[np.argmin(np.abs(allowed - v))])
+    return max(0.0, min(1.0, v))
 
 
 
@@ -69,25 +59,36 @@ class FPLEnv(gym.Env):
         temperature: float = 1.0,
         pool_per_pos: int = 20, # number of players to choose from in each position
         transfer_hit: float = -4.0,
-        max_free_transfers: int = 5
+        max_free_transfers: int = 5,
+        n_features: int = 7,
+        randomize_start: bool = True,
+        max_episode_gws: int = 12
     ):
+        
         super().__init__()
         self.seasons = list(seasons)
         self.base_dir = base_dir
         self.load_season_fn = load_season_fn
         self.load_gw_fn = load_gw_fn
         self.models = models
+        self.randomize_start = randomize_start
+        self.max_episode_gws = max_episode_gws
         self.start_gw = int(start_gw)
+        self.start_gw_actual: int = self.start_gw
         self.budget = float(budget)
         self.illegal_penalty = float(illegal_penalty)
         self.temperature = float(temperature)
         self.transfer_hit = float(transfer_hit)
         self.max_free_transfers = int(max_free_transfers)
         self.max_pool_size = 4 * pool_per_pos
+        self.SKIP_IN = self.max_pool_size
+        self.n_features = int(n_features)
+        
         # Will be set at reset()
         self.season: str = ""
         self.season_ctx: Any = None
         self.total_gws: int = 38
+        self.end_gw: int = self.total_gws
         self.current_gw: int = self.start_gw
         self.step_in_episode: int = 0
 
@@ -101,14 +102,14 @@ class FPLEnv(gym.Env):
         self.free_transfers: int = 1
 
         self.action_space = spaces.MultiDiscrete([
-            16,                    # out1: 0..14 are squad slots, 15 = "no transfer"
-            self.max_pool_size+1,  # in1:  0..max_pool_size-1, max_pool_size = "no transfer"
-            16,                    # out2: 0..14, 15 = "no second transfer"
-            self.max_pool_size+1,  # in2:  sentinel as above
+            16,                    # out: 0..14 , 15 = skip
+            self.max_pool_size+1,  # in:  0..max_pool_size , +1 = skip
         ])
+        self.phase = 1 # 1 = transfer 1, 2 = transfer 2
+        self._pending_out_in = None  
 
         # Observation: 15 × (price, xP, 5 features) + bank + free transfers
-        self.obs_dim = 15 * 9 + 2
+        self.obs_dim = 15 * (2 + self.n_features) + 2
         self.observation_space = spaces.Box(low=-np.inf, high=np.inf,
                                             shape=(self.obs_dim,), dtype=np.float32)
 
@@ -119,8 +120,112 @@ class FPLEnv(gym.Env):
         self._team_score_exp: float = 0.0
 
     # ===== Helpers =====
-    def _pvec(self, p: Player, is_c=False, is_v=False) -> np.ndarray:
-        return np.array([p.price, p.xP, *p.features, float(is_c), float(is_v)], dtype=np.float32)
+    # Masks for legal out/in choices for second transfer phase
+    def _skip_sentinel(self) -> Tuple[int, int]:
+        # out=15, in=self.SKIP_IN means "skip"
+        return 15, self.SKIP_IN
+
+    def _is_skip_pair(self, out_idx: int, in_idx: int) -> bool:
+        # only the fixed SKIP_IN is skip; values >= pool_size but < SKIP_IN are invalid, not skip
+        return (out_idx >= 15) or (in_idx == self.SKIP_IN)
+
+
+    def _legal_incoming_indices(self, temp_squad: "Squad", out_idx: int) -> np.ndarray:
+        mask_in = np.zeros(self.max_pool_size + 1, dtype=np.int8)
+        mask_in[self.SKIP_IN] = 1  # always allow skip sentinel
+
+        if out_idx >= 15:
+            return mask_in  # no real out -> only skip is allowed
+
+        # Try only the actually-present pool candidates: 0..pool_size-1
+        for j in range(self.pool_size):
+            incoming = self.pool[j]
+            trial = copy.deepcopy(temp_squad)
+            if not trial.can_swap(out_idx, incoming):
+                continue
+            trial.apply_swap(out_idx, incoming)
+            if trial.bank >= -1e-9:
+                mask_in[j] = 1
+
+        # Note: indices in [pool_size, max_pool_size) remain 0 (invalid), SKIP_IN is 1
+        return mask_in
+
+
+
+    def _build_masks(self) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Build masks for the current phase.
+        Returns (mask_out[16], mask_in[self.pool_size+1]).
+        """
+        mask_out = np.zeros(16, dtype=np.int8)
+        mask_in  = np.zeros(self.max_pool_size + 1, dtype=np.int8)
+
+        mask_out[15] = 1
+        mask_in[self.SKIP_IN] = 1
+
+        incoming1_pid = None
+        if self.phase == 2 and (self._pending_out_in is None or self._is_skip_pair(*self._pending_out_in)):
+            return mask_out, mask_in
+        
+        # Which squad context do we validate against?
+        # Phase 1: current squad
+        # Phase 2: hypothetical squad after applying pending out/in (if any)
+        if self.phase == 1 or self._pending_out_in is None or self._is_skip_pair(*self._pending_out_in):
+            temp_squad = self.squad
+            sold1_pid = None
+            used_out_slot = None
+        else:
+            # simulate first swap on a copy
+            out1, in1 = self._pending_out_in
+            temp_squad = copy.deepcopy(self.squad)
+            if not self._is_skip_pair(out1, in1):
+                if in1 < self.pool_size and out1 < 15 and temp_squad.can_swap(out1, self.pool[in1]):
+                    sold1_pid = temp_squad.players[out1].pid
+                    incoming1_pid = self.pool[in1].pid
+                    used_out_slot = out1
+                    temp_squad.apply_swap(out1, self.pool[in1])
+                else:
+                    sold1_pid = None
+                    incoming1_pid = None
+                    used_out_slot = None
+            else:
+                sold1_pid = None
+                incoming1_pid = None
+                used_out_slot = None
+
+        for out_idx in range(15):
+            if self.phase == 2 and used_out_slot is not None and out_idx == used_out_slot:
+                continue
+            in_mask = self._legal_incoming_indices(temp_squad, out_idx)
+            if self.phase == 2 and sold1_pid is not None:
+                for j in range(self.pool_size):           # only iterate real pool indices
+                    if in_mask[j] and self.pool[j].pid == sold1_pid:
+                        in_mask[j] = 0
+            # enable out only if some non-skip incoming remains
+            if np.any(in_mask[:self.pool_size]):          # non-skip, real candidates
+                mask_out[out_idx] = 1
+
+        if self.phase == 2 and self._pending_out_in is not None:
+            out1, in1 = self._pending_out_in
+            if not self._is_skip_pair(out1, in1):
+                mask_in = self._legal_incoming_indices(temp_squad, out1)
+                if sold1_pid is not None:
+                    for j in range(self.pool_size):
+                        if mask_in[j] and self.pool[j].pid == sold1_pid:
+                            mask_in[j] = 0
+                if incoming1_pid is not None:
+                    for j in range(self.pool_size):
+                        if mask_in[j] and self.pool[j].pid == incoming1_pid:
+                            mask_in[j] = 0
+                mask_in[self.SKIP_IN] = 1
+
+        return mask_out, mask_in
+
+
+
+    # ===== Squad & Pool Helpers =====
+    def _pvec(self, p: Player) -> np.ndarray:
+        return np.array([p.price, p.xP, *p.features], dtype=np.float32)
 
     def _gw_points_maps_from_df(self, gw_df):
         """Build maps for realized scoring from a GW dataframe."""
@@ -204,8 +309,7 @@ class FPLEnv(gym.Env):
 
 
     def _obs(self) -> np.ndarray:
-        vecs = [self._pvec(p, is_c=(i == self._captain_idx), is_v=(i == self._vice_idx))
-                for i, p in enumerate(self.squad.players)]
+        vecs = [self._pvec(p) for p in self.squad.players]
         flat = np.concatenate(vecs, axis=0)
         extras = np.array([self.squad.bank, float(self.free_transfers)], dtype=np.float32)
         return np.concatenate([flat, extras], axis=0)
@@ -379,6 +483,8 @@ class FPLEnv(gym.Env):
 
     def reset(self, *, seed=None, options=None):
         super().reset(seed=seed)
+
+        # Load season
         self.season = random.choice(self.seasons)
         self.season_ctx, self.total_gws = self.load_season_fn(self.base_dir, self.season)
         if ("predictor" not in self.season_ctx) and (self.models is not None):
@@ -394,45 +500,56 @@ class FPLEnv(gym.Env):
                     fixtures_raw_df=fixtures,
                     models=self.models
                 )
-        self.current_gw = 1
-        self.episode_gws = int(self.total_gws - 1)
+
+        # Pick a start GW
+        if self.randomize_start:
+            # cap at 33 so you can fit up to 12 GWs without passing 38; also guard by season length
+            hi = min(33, max(1, self.total_gws)) 
+            self.start_gw_actual = random.randint(1, hi)
+        else:
+            self.start_gw_actual = max(1, min(self.start_gw, self.total_gws))
+
+        # Define end_gw and length
+        self.end_gw = min(self.total_gws, self.start_gw_actual + self.max_episode_gws - 1)
+        self.current_gw = self.start_gw_actual
         self.step_in_episode = 0
         self.free_transfers = 1
-        result_gw1 = self.load_gw_fn(self.season_ctx, 1)
-        if isinstance(result_gw1, tuple) and len(result_gw1) == 3:
-            pool_gw1, index_map_gw1, gw1_df = result_gw1
-            self._points_map, self._played_map = self._gw_points_maps_from_df(gw1_df)
+
+        # Load pool + realized maps for the CURRENT GW
+        result = self.load_gw_fn(self.season_ctx, self.current_gw)
+        if isinstance(result, tuple) and len(result) == 3:
+            self.pool, self.index_map, gw_df = result
+            self._points_map, self._played_map = self._gw_points_maps_from_df(gw_df)
         else:
-            pool_gw1, index_map_gw1 = result_gw1
+            self.pool, self.index_map = result
             self._points_map, self._played_map = {}, {}
 
-        self.pool = pool_gw1
-        self.index_map = index_map_gw1
         self.pool_size = len(self.pool)
-        # self.action_space = spaces.MultiDiscrete([15 + 1, max(1, self.pool_size) + 1, 15, 15])
 
+        # Build initial squad from *this* GW’s pool
         self.squad = self._semi_random_initial_squad()
+
+        # Best XI & band for info (expected score not strictly required but handy)
         self._xi_idx = self._best_xi()
         self._captain_idx, self._vice_idx = self._best_band_for_xi(self._xi_idx)
         self._team_score_exp = self._expected_team_score(self._xi_idx, self._captain_idx, self._vice_idx)
-        self.current_gw = 2
-        result_gw2 = self.load_gw_fn(self.season_ctx, 2)
-        if isinstance(result_gw2, tuple) and len(result_gw2) == 3:
-            self.pool, self.index_map, gw2_df = result_gw2
-            self._points_map, self._played_map = self._gw_points_maps_from_df(gw2_df)
-        else:
-            self.pool, self.index_map = result_gw2
-            self._points_map, self._played_map = {}, {}
 
-        self.pool_size = len(self.pool)
-        # self.action_space = spaces.MultiDiscrete([15 + 1, self.pool_size + 1, 15, 15])
+        # Set phase/masks for sequential action picking
+        self.phase = 1
+        self._pending_out_in = None
 
-        pid_to_pool = {pl.pid: pl for pl in self.pool}
-        for i, p in enumerate(self.squad.players):
-            if p.pid in pid_to_pool:
-                self.squad.players[i] = pid_to_pool[p.pid]
+        obs = self._obs()
+        info = self._info_dict(action="init")
+        info.update({
+            "phase": self.phase,
+            "start_gw": self.start_gw_actual,
+            "end_gw": self.end_gw,
+        })
+        mask_out, mask_in = self._build_masks()
+        info["action_mask_out"] = mask_out
+        info["action_mask_in"] = mask_in
+        return obs, info
 
-        return self._obs(), self._info_dict(action="init_gw2")
 
     def _best_band_for_xi(self, xi_idx):
         # Sort XI by xP, highest first
@@ -450,6 +567,9 @@ class FPLEnv(gym.Env):
             "vice_captain": self.squad.players[self._vice_idx].name if self._vice_idx >= 0 else None,
             "xi_indices": self._xi_idx,
             "bank": self.squad.bank,
+            "phase": self.phase,
+            "action_mask_out": '',
+            "action_mask_in": '',
             "free_transfers": self.free_transfers,
             "action": action,
             "points_hit": points_hit
@@ -457,108 +577,134 @@ class FPLEnv(gym.Env):
 
 
     def step(self, action: np.ndarray):
-        """
-        Action = (out1, in1, out2, in2, cap_idx, vc_idx)
-        - out* in {0..14}, 15 = 'no transfer'
-        - in*  in {0..pool_size-1}, pool_size = 'no transfer'
-        - cap_idx, vc_idx in {0..14}
+        # Early termination guard
+        if self.current_gw > self.end_gw or self.step_in_episode >= (self.end_gw - self.start_gw_actual + 1):
+            info = self._info_dict(action="already_done")
+            mask_out, mask_in = self._build_masks()
+            info.update({"phase": self.phase, "action_mask_out": mask_out, "action_mask_in": mask_in,
+                        "start_gw": self.start_gw_actual, "end_gw": self.end_gw})
+            return self._obs(), 0.0, True, False, info
 
-        Both transfers are decided relative to the ORIGINAL squad of this GW.
-        We validate/apply them on a temporary copy, then commit once both pass.
-        """
-        # --- episode end guard ---
-        if self.step_in_episode >= self.episode_gws:
-            return self._obs(), 0.0, True, False, self._info_dict(action="already_done")
+        a = np.asarray(action, dtype=np.int64).reshape(-1)
+        if a.size != 2:
+            raise ValueError(...)
+        out, inn = map(int, a)
 
+        # clamp to action space range
+        if inn < 0: inn = 0
+        if inn > self.max_pool_size: inn = self.SKIP_IN
+
+        # OPTIONAL: normalize values ≥ current pool_size to skip to avoid “phantom” indices
+        if inn >= self.pool_size and inn != self.SKIP_IN:
+            inn = self.SKIP_IN
+
+        # Build masks and sanitize
+        # Build masks and sanitize 'out' first
+        mask_out, _ = self._build_masks()
+        if out < 0 or out > 15 or mask_out[out] == 0:
+            out = 15
+
+        # If we're in phase 1, we don't sanitize 'inn' further (skip-only mask is fine)
+        # If we're in phase 2, recompute an 'in' mask for the actually chosen out
+        if self.phase == 1:
+            # Use the coarse mask; anything non-allowed becomes SKIP
+            _, mask_in = self._build_masks()
+            if mask_in[inn] == 0:
+                inn = self.SKIP_IN
+        else:
+            # Build phase-2 context (same logic as in _build_masks)
+            sold1_pid = None
+            incoming1_pid = None
+            used_out_slot = None
+            temp_squad2 = copy.deepcopy(self.squad)
+            if self._pending_out_in is not None:
+                out1, in1 = self._pending_out_in
+                if not self._is_skip_pair(out1, in1):
+                    if in1 < self.pool_size and out1 < 15 and temp_squad2.can_swap(out1, self.pool[in1]):
+                        sold1_pid = temp_squad2.players[out1].pid
+                        incoming1_pid = self.pool[in1].pid
+                        used_out_slot = out1
+                        temp_squad2.apply_swap(out1, self.pool[in1])
+
+            # Now compute the legal incoming mask for the ACTUAL phase-2 'out'
+            mask_in2 = self._legal_incoming_indices(temp_squad2, out)
+
+            # Enforce no buy-back of sold1 and no duplicate incoming
+            if sold1_pid is not None:
+                for j in range(self.pool_size):
+                    if mask_in2[j] and self.pool[j].pid == sold1_pid:
+                        mask_in2[j] = 0
+            if incoming1_pid is not None:
+                for j in range(self.pool_size):
+                    if mask_in2[j] and self.pool[j].pid == incoming1_pid:
+                        mask_in2[j] = 0
+
+            mask_in2[self.SKIP_IN] = 1
+            if inn < 0 or inn > self.max_pool_size or mask_in2[inn] == 0:
+                inn = self.SKIP_IN
+
+
+        # ===== Phase 1: store choice, no reward yet =====
+        if self.phase == 1:
+            self._pending_out_in = (out, inn)
+            self.phase = 2
+
+            obs = self._obs()
+            info = self._info_dict(action="phase1_choice")
+            # next masks (for phase 2)
+            mask_out2, mask_in2 = self._build_masks()
+            info.update({"phase": self.phase, "action_mask_out": mask_out2, "action_mask_in": mask_in2})
+            return obs, 0.0, False, False, info
+
+        # ===== Phase 2: apply both, compute reward, advance GW =====
         self.step_in_episode += 1
         done = False
         points_hit = 0.0
 
-        # --- parse & normalize ---
-        a = np.asarray(action, dtype=np.int64).reshape(-1)
-        if a.size != 4:
-            raise ValueError(f"Expected 6 ints (out1,in1,out2,in2,cap,vc); got {a} with shape {a.shape}")
-        out1, in1, out2, in2 = map(int, a)
-
-        # Bring incoming sentinels in line with current pool size
-        if in1 >= self.pool_size: in1 = self.pool_size
-        if in2 >= self.pool_size: in2 = self.pool_size
-
-        # Snapshot ORIGINAL state for planning + baseline comparison
+        # Snapshot ORIGINAL state for baseline comparison
         baseline_players = list(self.squad.players)
-        baseline_squad   = copy.deepcopy(self.squad)  # deep copy to trial swaps
+        baseline_squad   = copy.deepcopy(self.squad)
 
-        # --- helpers ---
-        def is_skip(o, i) -> bool:
-            return (o >= 15) or (i >= self.pool_size)
+        # Resolve first and second choices
+        out1, in1 = self._pending_out_in if self._pending_out_in is not None else self._skip_sentinel()
+        out2, in2 = out, inn
 
-        def validate_bounds(o_idx: int, i_idx: int) -> Tuple[bool, Dict[str, str]]:
-            if o_idx < 0 or o_idx > 15:
-                return False, {"illegal": "out_of_range"}
-            if i_idx < 0 or i_idx > self.pool_size:
-                return False, {"illegal": "in_of_range"}
-            return True, {}
-
-        # --- guards to forbid certain combinations of both transfers ---
-        # If both transfers requested, disallow using the same out-slot twice
-        if not is_skip(out1, in1) and not is_skip(out2, in2):
-            if out1 == out2:
-                return self._obs(), self.illegal_penalty, False, False, {"illegal": "duplicate_out_slot"}
-            # Forbid buy-back of the other swap’s sold player (based on original PID)
-            sold1_pid = baseline_players[out1].pid if out1 < 15 else None
-            sold2_pid = baseline_players[out2].pid if out2 < 15 else None
-            if in2 < self.pool_size and sold1_pid is not None and self.pool[in2].pid == sold1_pid:
-                return self._obs(), self.illegal_penalty, False, False, {"illegal": "buy_back_same_player"}
-            if in1 < self.pool_size and sold2_pid is not None and self.pool[in1].pid == sold2_pid:
-                return self._obs(), self.illegal_penalty, False, False, {"illegal": "buy_back_same_player"}
-
-        # --- validate bounds early ---
-        for (o_idx, i_idx) in [(out1, in1), (out2, in2)]:
-            ok, info = validate_bounds(o_idx, i_idx)
-            if not ok:
-                return self._obs(), self.illegal_penalty, False, False, info
-
-        # --- attempt swaps on the TEMP copy of the baseline squad ---
-        def try_apply_on_temp(temp_squad: "Squad", o_idx: int, i_idx: int) -> Tuple[bool, Dict[str, str]]:
-            if is_skip(o_idx, i_idx):
-                return False, {}
+        # Helper to try a swap on temp
+        def try_apply_on_temp(temp_squad: "Squad", o_idx: int, i_idx: int) -> bool:
+            if self._is_skip_pair(o_idx, i_idx):
+                return False
             if o_idx >= 15 or i_idx >= self.pool_size:
-                return False, {"illegal": "index_out_of_range"}
+                return False
             incoming = self.pool[i_idx]
             if not temp_squad.can_swap(o_idx, incoming):
-                return False, {"illegal": "cannot_swap"}
-            temp_squad.apply_swap(o_idx, incoming)  # in-place replace at slot o_idx
-            return True, {}
+                return False
+            temp_squad.apply_swap(o_idx, incoming)
+            return True
 
-        # Work entirely on temp copy; this ensures both swaps are planned off ORIGINAL indices
+        # Work on a temp copy
         temp_squad = copy.deepcopy(baseline_squad)
-        applied1, info1 = try_apply_on_temp(temp_squad, out1, in1)
-        if info1.get("illegal"):
-            return self._obs(), self.illegal_penalty, False, False, info1
+        applied1 = try_apply_on_temp(temp_squad, out1, in1)
+        applied2 = try_apply_on_temp(temp_squad, out2, in2)
 
-        applied2, info2 = try_apply_on_temp(temp_squad, out2, in2)
-        if info2.get("illegal"):
-            return self._obs(), self.illegal_penalty, False, False, info2
-
-        # --- compute hits (relative to current free_transfers) ---
+        # Hits relative to free transfers
         transfers_made = int(applied1) + int(applied2)
         ft_consumed = min(self.free_transfers, transfers_made)
         extra_transfers = transfers_made - ft_consumed
         if extra_transfers > 0:
             points_hit += self.transfer_hit * extra_transfers
 
-        # --- commit temp result to real squad ---
+        # Commit
         if transfers_made > 0:
             self.squad = temp_squad
             self.free_transfers -= ft_consumed
             if self.free_transfers < 0:
                 self.free_transfers = 0
 
-        # --- (Re)pick XI & apply C/VC (must be in XI and distinct) ---
+        # (Re)pick XI & band
         self._xi_idx = self._best_xi()
         self._captain_idx, self._vice_idx = self._best_band_for_xi(self._xi_idx)
 
-        # --- realized vs skip (counterfactual) ---
+        # Realized vs skip (counterfactual)
         points_map = getattr(self, "_points_map", {})
         played_map = getattr(self, "_played_map", {})
 
@@ -566,7 +712,6 @@ class FPLEnv(gym.Env):
             self.squad.players, self._xi_idx, self._captain_idx, self._vice_idx, points_map, played_map
         )
 
-        # Baseline (no transfers) greedy XI & band on original
         def _best_xi_and_band_tmp(players):
             pos_lists = {pos: sorted([(i, q) for i, q in enumerate(players) if q.pos == pos],
                                     key=lambda t: t[1].xP, reverse=True) for pos in POS_ORDER}
@@ -594,11 +739,15 @@ class FPLEnv(gym.Env):
         )
 
         reward = (actual_realized - skip_realized) + points_hit
-        self._team_score_exp = actual_realized  # for info panel
+        self._team_score_exp = actual_realized
 
-        # --- advance GW ---
-        self.current_gw += 1
-        if self.step_in_episode < self.episode_gws:
+        # Advance GW
+        self.current_gw += 1  # advance to next GW
+        # done if we’ve stepped past end_gw
+        done = self.current_gw > self.end_gw
+
+        if not done:
+            # Load next GW pool/maps
             result = self.load_gw_fn(self.season_ctx, self.current_gw)
             if isinstance(result, tuple) and len(result) == 3:
                 self.pool, self.index_map, next_gw_df = result
@@ -606,20 +755,29 @@ class FPLEnv(gym.Env):
             else:
                 self.pool, self.index_map = result
                 self._points_map, self._played_map = {}, {}
-
             self.pool_size = len(self.pool)
-
-            # Refresh squad players with next-GW stats (by PID)
+            # Refresh by PID
             pid_to_pool = {pl.pid: pl for pl in self.pool}
             for i, p in enumerate(self.squad.players):
                 if p.pid in pid_to_pool:
                     self.squad.players[i] = pid_to_pool[p.pid]
-
-            # Bank a FT only if no transfers were made this GW
+            # Bank FT if no transfers this GW
             if transfers_made == 0:
                 self.free_transfers = min(self.free_transfers + 1, self.max_free_transfers)
-        else:
-            done = True
 
-        return self._obs(), reward, done, False, self._info_dict(action="step", points_hit=points_hit)
+        # Reset the two-phase state for the next GW (or for the terminal info)
+        self.phase = 1
+        self._pending_out_in = None
+
+        obs = self._obs()
+        info = self._info_dict(action="step", points_hit=points_hit)
+        mask_out_next, mask_in_next = self._build_masks()
+        info.update({
+            "phase": self.phase,
+            "action_mask_out": mask_out_next,
+            "action_mask_in": mask_in_next,
+            "start_gw": self.start_gw_actual,
+            "end_gw": self.end_gw
+        })
+        return obs, reward, done, False, info
 
